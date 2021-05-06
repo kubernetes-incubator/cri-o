@@ -25,6 +25,8 @@ import (
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/opencontainers/runtime-tools/generate"
 	"github.com/pkg/errors"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/trace"
 )
 
 type orderedMounts []rspec.Mount
@@ -408,6 +410,11 @@ func hostNetwork(containerConfig *types.ContainerConfig) bool {
 // CreateContainer creates a new container in specified PodSandbox
 func (s *Server) CreateContainer(ctx context.Context, req *types.CreateContainerRequest) (res *types.CreateContainerResponse, retErr error) {
 	log.Infof(ctx, "Creating container: %s", translateLabelsToDescription(req.Config.Labels))
+
+	tracer := otel.GetTracerProvider().Tracer(s.tracerName)
+	var span trace.Span
+	ctx, span = tracer.Start(ctx, "create-container")
+	defer span.End()
 
 	s.updateLock.RLock()
 	defer s.updateLock.RUnlock()
