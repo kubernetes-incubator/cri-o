@@ -182,6 +182,8 @@ func (c *container) SpecAddAnnotations(ctx context.Context, sb *sandbox.Sandbox,
 				// Annotation not suffixed with the container name
 				c.spec.AddAnnotation(k, v)
 			}
+		} else {
+			c.spec.AddAnnotation(k, v)
 		}
 	}
 
