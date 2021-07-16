@@ -47,6 +47,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.10.0
 	github.com/psampaz/go-mod-outdated v0.7.0
+	github.com/rjeczalik/notify v0.9.2
 	github.com/sirupsen/logrus v1.8.1
 	github.com/soheilhy/cmux v0.1.5
 	github.com/stretchr/testify v1.7.0

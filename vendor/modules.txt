@@ -778,6 +778,9 @@ github.com/psampaz/go-mod-outdated/internal/mod
 github.com/psampaz/go-mod-outdated/internal/runner
 # github.com/rivo/uniseg v0.2.0
 github.com/rivo/uniseg
+# github.com/rjeczalik/notify v0.9.2
+## explicit
+github.com/rjeczalik/notify
 # github.com/rootless-containers/rootlesskit v0.14.0-beta.0
 github.com/rootless-containers/rootlesskit/pkg/api
 github.com/rootless-containers/rootlesskit/pkg/msgutil
