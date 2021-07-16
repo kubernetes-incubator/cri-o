@@ -20,10 +20,10 @@ import (
 	"github.com/cri-o/cri-o/pkg/config"
 	types "github.com/cri-o/cri-o/server/cri/types"
 	"github.com/cri-o/cri-o/utils"
-	"github.com/fsnotify/fsnotify"
 	json "github.com/json-iterator/go"
 	rspec "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"github.com/rjeczalik/notify"
 	"github.com/sirupsen/logrus"
 	"golang.org/x/net/context"
 	"golang.org/x/sys/unix"
@@ -342,8 +342,14 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 	cmd.Stdout = &stdoutBuf
 	cmd.Stderr = &stderrBuf
 
-	err = cmd.Start()
+	pidFileCreatedDone := make(chan struct{}, 1)
+	pidFileCreatedCh, err := WatchForFile(pidFile, pidFileCreatedDone, notify.InModify, notify.InMovedTo)
 	if err != nil {
+		return nil, errors.Wrapf(err, "failed to watch %s", pidFile)
+	}
+
+	doneErr := cmd.Start()
+	if doneErr != nil {
 		return nil, err
 	}
 
@@ -351,9 +357,26 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 	done := make(chan error, 1)
 	go func() {
 		done <- cmd.Wait()
+		close(done)
 	}()
 
-	if timeout > 0 {
+	// First, wait for the pid file to be created.
+	// When it is, the timer begins for the exec process.
+	// If the command fails before that happens, however,
+	// that needs to be caught.
+	select {
+	case <-pidFileCreatedCh:
+	case doneErr = <-done:
+	}
+	close(pidFileCreatedDone)
+
+	switch {
+	case doneErr != nil:
+		// If we've already gotten an error from done
+		// the runtime finished before writing the pid file
+		// (probably because the command didn't exist).
+	case timeout > 0:
+		// If there's a timeout, wait for that timeout duration.
 		select {
 		case <-time.After(time.Second * time.Duration(timeout)):
 			// Ensure the process is not left behind
@@ -369,17 +392,18 @@ func (r *runtimeOCI) ExecSyncContainer(ctx context.Context, c *Container, comman
 				Stderr:   []byte(conmonconfig.TimedOutMessage),
 				ExitCode: -1,
 			}, nil
-		case err = <-done:
+		case doneErr = <-done:
 			break
 		}
-	} else {
-		err = <-done
+	default:
+		// If no timeout, just wait until the command finishes.
+		doneErr = <-done
 	}
 
 	// gather exit code from err
 	exitCode := int32(0)
-	if err != nil {
-		if exitError, ok := err.(*exec.ExitError); ok {
+	if doneErr != nil {
+		if exitError, ok := doneErr.(*exec.ExitError); ok {
 			exitCode = int32(exitError.ExitCode())
 		}
 	}
@@ -953,58 +977,22 @@ func (r *runtimeOCI) ReopenContainerLog(c *Container) error {
 	}
 	defer controlFile.Close()
 
-	watcher, err := fsnotify.NewWatcher()
+	done := make(chan struct{}, 1)
+	ch, err := WatchForFile(c.LogPath(), done, notify.InCreate, notify.InModify)
 	if err != nil {
-		return fmt.Errorf("failed to create new watch: %v", err)
-	}
-	defer watcher.Close()
-
-	done := make(chan struct{})
-	doneClosed := false
-	errorCh := make(chan error)
-	go func() {
-		for {
-			select {
-			case event := <-watcher.Events:
-				logrus.Debugf("event: %v", event)
-				if event.Op&fsnotify.Create == fsnotify.Create || event.Op&fsnotify.Write == fsnotify.Write {
-					logrus.Debugf("file created %s", event.Name)
-					if event.Name == c.LogPath() {
-						logrus.Debugf("expected log file created")
-						done <- struct{}{}
-						return
-					}
-				}
-			case err := <-watcher.Errors:
-				errorCh <- fmt.Errorf("watch error for container log reopen %v: %v", c.ID(), err)
-				close(errorCh)
-				return
-			}
-		}
-	}()
-	cLogDir := filepath.Dir(c.LogPath())
-	if err := watcher.Add(cLogDir); err != nil {
-		logrus.Errorf("watcher.Add(%q) failed: %s", cLogDir, err)
-		close(done)
-		doneClosed = true
+		return errors.Wrapf(err, "failed to create watch for %s", c.LogPath())
 	}
 
 	if _, err = fmt.Fprintf(controlFile, "%d %d %d\n", 2, 0, 0); err != nil {
 		logrus.Debugf("Failed to write to control file to reopen log file: %v", err)
 	}
-
 	select {
-	case err := <-errorCh:
-		if !doneClosed {
-			close(done)
-		}
-		return err
-	case <-done:
-		if !doneClosed {
-			close(done)
-		}
-		break
+	case <-ch:
+	case <-time.After(time.Minute * 3):
+		// Give up after 3 minutes, as something wrong probably happened
+		logrus.Errorf("Failed to reopen log file for container %s: timed out", c.ID())
 	}
+	close(done)
 
 	return nil
 }
@@ -1100,4 +1088,35 @@ func (r *Runtime) SpoofOOM(c *Container) {
 
 func ConmonPath(r *Runtime) string {
 	return r.config.Conmon
+}
+
+// WatchForFile creates a watch on the parent directory of path, looking for events opsToWatch.
+// It returns immediately with a channel to find when path had one of those events.
+// done can be used to stop the watch.
+// WatchForFile is responsible for closing all internal channels and the returned channel, but not for closing done.
+func WatchForFile(path string, done chan struct{}, opsToWatch ...notify.Event) (chan struct{}, error) {
+	eiCh := make(chan notify.EventInfo, 1)
+	ch := make(chan struct{})
+
+	dir := filepath.Dir(path)
+	if err := notify.Watch(dir, eiCh, opsToWatch...); err != nil {
+		return nil, err
+	}
+	go func() {
+		defer close(ch)
+		defer close(eiCh)
+		defer notify.Stop(eiCh)
+		for {
+			select {
+			case ei := <-eiCh:
+				if ei.Path() == path {
+					ch <- struct{}{}
+					return
+				}
+			case <-done:
+				return
+			}
+		}
+	}()
+	return ch, nil
 }
